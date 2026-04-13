@@ -3,25 +3,19 @@ import os
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# =========================================================
-# GLOBALS
-# =========================================================
 G_DF: Optional[pd.DataFrame] = None
 
 
-# =========================================================
-# DATA STRUCTURES
-# =========================================================
 @dataclass
 class Signal:
     family: str
-    direction: int  # 1 buy, -1 sell
+    direction: int
     score: float
     entry_price: float
     stop_price: float
@@ -61,9 +55,6 @@ class Metrics:
     avg_hold_bars: float
 
 
-# =========================================================
-# DATA LOADING
-# =========================================================
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     lower_map = {c.lower().strip(): c for c in df.columns}
     rename_map = {}
@@ -109,9 +100,6 @@ def load_csv(path: str) -> pd.DataFrame:
     return normalize_columns(df)
 
 
-# =========================================================
-# FEATURES
-# =========================================================
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
@@ -127,7 +115,11 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["tr"] = tr
     out["atr_14"] = out["tr"].rolling(14, min_periods=1).mean()
     out["atr_50"] = out["tr"].rolling(50, min_periods=1).mean()
-    out["atr_ratio"] = (out["atr_14"] / out["atr_50"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    out["atr_ratio"] = (
+        (out["atr_14"] / out["atr_50"].replace(0, np.nan))
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(1.0)
+    )
 
     for span in [5, 9, 13, 21, 34, 50, 100]:
         out[f"ema_{span}"] = out["close"].ewm(span=span, adjust=False).mean()
@@ -140,12 +132,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"ll_{lb}"] = out["low"].rolling(lb, min_periods=1).min().shift(1)
 
     out["vol_ma_20"] = out["volume"].rolling(20, min_periods=1).mean()
-
-    # referências para sweep
     out["recent_high_10"] = out["high"].rolling(10, min_periods=1).max().shift(1)
     out["recent_low_10"] = out["low"].rolling(10, min_periods=1).min().shift(1)
 
-    # swings simples
     out["swing_high_3"] = (
         (out["high"] > out["high"].shift(1))
         & (out["high"] > out["high"].shift(-1))
@@ -159,9 +148,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# =========================================================
-# SPLITS / HELPERS
-# =========================================================
 def split_walkforward(n: int, train_pct: float = 0.60, valid_pct: float = 0.20) -> Dict[str, Tuple[int, int]]:
     train_end = int(n * train_pct)
     valid_end = int(n * (train_pct + valid_pct))
@@ -179,9 +165,6 @@ def in_session(ts, start_hour: int, end_hour: int) -> bool:
     return start_hour <= h <= end_hour
 
 
-# =========================================================
-# SIGNALS
-# =========================================================
 def calc_breakout_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
     if i < p["bo_lookback"] + 2:
         return None
@@ -208,21 +191,21 @@ def calc_breakout_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
     ll = prev[f"ll_{p['bo_lookback']}"]
 
     score = 0.0
+
     if fast > slow:
-        score += 2.0
+        score += 1.5
     elif fast < slow:
-        score += 2.0
+        score += 1.5
 
     if abs(slope) >= p["bo_slope_min"]:
-        score += 2.0
-
-    if prev["body"] >= prev["atr_14"] * p["bo_expansion_body_atr"]:
-        score += 3.0
-
-    if prev["volume"] >= prev["vol_ma_20"] * p["bo_vol_mult"]:
         score += 1.0
 
-    # breakout long
+    if prev["body"] >= prev["atr_14"] * p["bo_expansion_body_atr"]:
+        score += 2.0
+
+    if prev["volume"] >= prev["vol_ma_20"] * p["bo_vol_mult"]:
+        score += 0.5
+
     if row["high"] >= hh + p["bo_buffer"]:
         if p["bo_require_trend"] and not (fast > slow):
             return None
@@ -239,7 +222,6 @@ def calc_breakout_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
             reason="breakout_long",
         )
 
-    # breakout short
     if row["low"] <= ll - p["bo_buffer"]:
         if p["bo_require_trend"] and not (fast < slow):
             return None
@@ -278,13 +260,12 @@ def calc_sweep_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
 
     score = 0.0
 
-    # sweep topo -> short
     if row["high"] > recent_high + p["sw_sweep_buffer"] and row["close"] < recent_high:
-        score += 3.0
+        score += 2.0
         if row["body"] >= atr * p["sw_rejection_body_atr"]:
-            score += 2.0
+            score += 1.5
         if row["close"] < row["open"]:
-            score += 2.0
+            score += 1.5
 
         entry = row["close"] - p["slippage"]
         stop = row["high"] + p["sw_stop_buffer"]
@@ -303,13 +284,12 @@ def calc_sweep_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
             reason="sweep_short",
         )
 
-    # sweep fundo -> long
     if row["low"] < recent_low - p["sw_sweep_buffer"] and row["close"] > recent_low:
-        score += 3.0
+        score += 2.0
         if row["body"] >= atr * p["sw_rejection_body_atr"]:
-            score += 2.0
+            score += 1.5
         if row["close"] > row["open"]:
-            score += 2.0
+            score += 1.5
 
         entry = row["close"] + p["slippage"]
         stop = row["low"] - p["sw_stop_buffer"]
@@ -362,15 +342,14 @@ def calc_smc_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
 
     score = 0.0
     if bullish_bias:
-        score += 2.0
+        score += 1.5
     if bearish_bias:
-        score += 2.0
+        score += 1.5
     if displacement:
-        score += 3.0
+        score += 1.5
     if near_ema:
-        score += 2.0
+        score += 1.5
 
-    # pseudo-smc long
     if bullish_bias and bullish_bos and near_ema:
         entry = row["close"] + p["slippage"]
         stop = row["low"] - p["smc_stop_buffer"]
@@ -389,7 +368,6 @@ def calc_smc_signal(df: pd.DataFrame, i: int, p: Dict) -> Optional[Signal]:
             reason="smc_long",
         )
 
-    # pseudo-smc short
     if bearish_bias and bearish_bos and near_ema:
         entry = row["close"] - p["slippage"]
         stop = row["high"] + p["smc_stop_buffer"]
@@ -429,9 +407,6 @@ def choose_best_signal(signals: List[Optional[Signal]], p: Dict) -> Optional[Sig
     return filtered[0]
 
 
-# =========================================================
-# TRADE MANAGEMENT / BACKTEST
-# =========================================================
 def manage_trade(df: pd.DataFrame, signal: Signal, i: int, end_idx: int, p: Dict) -> Trade:
     max_hold = p["global_max_hold_bars"]
     last_idx = min(i + max_hold, end_idx - 1)
@@ -529,9 +504,6 @@ def run_backtest_multi_setup(df: pd.DataFrame, start_idx: int, end_idx: int, p: 
     return trades
 
 
-# =========================================================
-# METRICS / SCORE
-# =========================================================
 def calc_metrics(trades: List[Trade]) -> Metrics:
     if not trades:
         return Metrics(
@@ -589,46 +561,41 @@ def calc_metrics(trades: List[Trade]) -> Metrics:
 
 
 def robust_score(train_m: Metrics, valid_m: Metrics, test_m: Metrics) -> float:
-    if train_m.trades < 20:
-        return -10000 + train_m.trades
-    if valid_m.trades < 8:
-        return -5000 + valid_m.trades
-    if test_m.trades < 8:
-        return -5000 + test_m.trades
+    if train_m.trades < 8:
+        return -2000 + train_m.trades
+    if valid_m.trades < 3:
+        return -1000 + valid_m.trades
+    if test_m.trades < 3:
+        return -1000 + test_m.trades
 
     score = 0.0
-    score += min(valid_m.profit_factor, 4.0) * 22.0
-    score += min(test_m.profit_factor, 4.0) * 28.0
-    score += valid_m.total_r * 2.0
-    score += test_m.total_r * 2.5
-    score += valid_m.avg_r * 35.0
-    score += test_m.avg_r * 40.0
-    score += (valid_m.win_rate / 100.0) * 5.0
-    score += (test_m.win_rate / 100.0) * 5.0
-    score -= valid_m.max_dd_r * 2.0
-    score -= test_m.max_dd_r * 2.5
+    score += min(valid_m.profit_factor, 4.0) * 18.0
+    score += min(test_m.profit_factor, 4.0) * 22.0
+    score += valid_m.total_r * 1.5
+    score += test_m.total_r * 2.0
+    score += valid_m.avg_r * 25.0
+    score += test_m.avg_r * 30.0
+    score += (valid_m.win_rate / 100.0) * 4.0
+    score += (test_m.win_rate / 100.0) * 4.0
+    score -= valid_m.max_dd_r * 1.5
+    score -= test_m.max_dd_r * 2.0
 
     pf_gap = abs(valid_m.profit_factor - test_m.profit_factor)
-    score -= pf_gap * 8.0
+    score -= pf_gap * 6.0
 
     r_gap = abs(valid_m.total_r - test_m.total_r)
-    score -= r_gap * 1.5
+    score -= r_gap * 1.0
 
     return score
 
 
-# =========================================================
-# PARAMETER SPACE
-# =========================================================
 def sample_params(rng: random.Random) -> Dict:
     session_start = rng.randint(8, 12)
     session_end = rng.randint(max(13, session_start + 1), 18)
-
     ema_pairs = [(5, 13), (5, 21), (9, 21), (9, 34), (13, 34), (21, 50)]
     ema_fast, ema_slow = rng.choice(ema_pairs)
 
     return {
-        # globais
         "use_session": rng.choice([True, False]),
         "session_start": session_start,
         "session_end": session_end,
@@ -637,48 +604,32 @@ def sample_params(rng: random.Random) -> Dict:
         "slippage": rng.randint(0, 5),
         "global_max_hold_bars": rng.randint(3, 80),
 
-        # breakout
         "bo_lookback": rng.choice([5, 8, 13, 21]),
         "bo_buffer": rng.randint(0, 20),
-        "bo_min_range": rng.randint(0, 50),
-        "bo_min_body": rng.randint(0, 50),
-        "bo_min_atr_ratio": round(rng.uniform(0.2, 2.0), 2),
-        "bo_expansion_body_atr": round(rng.uniform(0.3, 2.0), 2),
-        "bo_vol_mult": round(rng.uniform(0.5, 2.0), 2),
-        "bo_slope_min": round(rng.uniform(0.0, 5.0), 4),
+        "bo_min_range": rng.randint(0, 20),
+        "bo_min_body": rng.randint(0, 20),
+        "bo_min_atr_ratio": round(rng.uniform(0.0, 1.2), 2),
+        "bo_expansion_body_atr": round(rng.uniform(0.0, 1.2), 2),
+        "bo_vol_mult": round(rng.uniform(0.0, 1.3), 2),
+        "bo_slope_min": round(rng.uniform(0.0, 1.0), 4),
         "bo_require_trend": rng.choice([True, False]),
         "bo_stop_points": rng.randint(10, 150),
         "bo_rr": round(rng.uniform(0.8, 5.0), 2),
-        "breakout_min_score": round(rng.uniform(1.0, 8.0), 2),
+        "breakout_min_score": round(rng.uniform(0.0, 4.0), 2),
 
-        # sweep
         "sw_sweep_buffer": rng.randint(0, 15),
-        "sw_rejection_body_atr": round(rng.uniform(0.1, 2.0), 2),
+        "sw_rejection_body_atr": round(rng.uniform(0.0, 1.0), 2),
         "sw_stop_buffer": rng.randint(1, 20),
         "sw_rr": round(rng.uniform(0.8, 5.0), 2),
-        "sweep_min_score": round(rng.uniform(1.0, 8.0), 2),
+        "sweep_min_score": round(rng.uniform(0.0, 4.0), 2),
 
-        # smc
         "smc_bos_lookback": rng.choice([5, 8, 13, 21]),
         "smc_bos_buffer": rng.randint(0, 15),
-        "smc_displacement_body_atr": round(rng.uniform(0.2, 2.5), 2),
-        "smc_pullback_atr": round(rng.uniform(0.1, 2.0), 2),
+        "smc_displacement_body_atr": round(rng.uniform(0.0, 1.2), 2),
+        "smc_pullback_atr": round(rng.uniform(0.0, 1.2), 2),
         "smc_stop_buffer": rng.randint(1, 20),
         "smc_rr": round(rng.uniform(0.8, 6.0), 2),
-        "smc_min_score": round(rng.uniform(1.0, 10.0), 2),
-    }
-
-
-# =========================================================
-# WORKER
-# =========================================================
-def split_walkforward(n: int, train_pct: float = 0.60, valid_pct: float = 0.20) -> Dict[str, Tuple[int, int]]:
-    train_end = int(n * train_pct)
-    valid_end = int(n * (train_pct + valid_pct))
-    return {
-        "train": (0, train_end),
-        "valid": (train_end, valid_end),
-        "test": (valid_end, n),
+        "smc_min_score": round(rng.uniform(0.0, 5.0), 2),
     }
 
 
@@ -732,9 +683,6 @@ def evaluate_candidate(candidate_id: int, params: Dict) -> Dict:
     }
 
 
-# =========================================================
-# SAVE HELPERS
-# =========================================================
 def save_csv(rows: List[Dict], path: str):
     if not rows:
         return
@@ -747,9 +695,6 @@ def save_checkpoint(rows: List[Dict], path: str):
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     parser = argparse.ArgumentParser(description="3-in-1 Hedge Fund Optimizer")
     parser.add_argument("--csv", type=str, default="wdo_m5.csv")
